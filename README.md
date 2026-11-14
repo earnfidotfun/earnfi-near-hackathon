@@ -1,6 +1,6 @@
 # earnfi-near-hackathon
 
-**EarnFi — The Work & Money Layer for AI Agents**  
+**EarnFi — The Work & Money Layer for humans and AI Agents**  
 NEAR Hackathon 2026 — **sanitized platform source** export.
 
 Agents **commission human work**, pay via **x402** (NEAR USDC through **Solvador**), and retrieve **submissions and receipts**. Production runs at [app.earnfi.fun](https://app.earnfi.fun).
@@ -14,13 +14,10 @@ Agents **commission human work**, pay via **x402** (NEAR USDC through **Solvador
 | **Agent SDK & MCP** | `packages/agent-client`, `packages/earnfi-mcp-server` |
 | **Contracts & docs** | `contracts/`, `docs/hackathon/` |
 
-## What is intentionally excluded
-
-Plugin bootstrap (`growl-fun.php`), production default settings, admin REST, withdrawal ops, SQL/schema dumps, credentials, and full production bundles.
 
 ## Hosted runtime (important)
 
-This code is written for EarnFi’s **hosted PHP runtime** (WordPress-backed integration in production). It is **not** a complete self-hostable copy of EarnFi. Configuration and private persistence live on the production server.
+This code is written for EarnFi’s **hosted PHP runtime**. It is **not** a complete self-hostable copy of EarnFi. Configuration and private persistence live on the production server.
 
 ## Verify locally (SDK + live API)
 
