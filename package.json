@@ -1,0 +1,19 @@
+{
+  "name": "earnfi-near-hackathon",
+  "private": true,
+  "description": "EarnFi NEAR Hackathon — SDK, MCP, contracts, live API examples",
+  "workspaces": [
+    "packages/agent-client",
+    "packages/earnfi-mcp-server"
+  ],
+  "scripts": {
+    "build:sdk": "npm run build -w @earn-fi/agent-client",
+    "build:mcp": "npm run build -w @earnfi/mcp-server",
+    "test": "npm test -w @earn-fi/agent-client",
+    "test:live": "npm run test:smoke -w @earn-fi/agent-client"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

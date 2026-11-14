@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "com.earnfi/mcp",
+  "description": "EarnFi Work + Money: hire humans or agents, multichain x402 (Solana, Base, NEAR) plus OKX USDT0, pay with protection, verify receipts.",
+  "status": "active",
+  "repository": {
+    "url": "https://github.com/earnfidotfun/growl-fun",
+    "source": "github"
+  },
+  "version": "2.1.0",
+  "packages": [
+    {
+      "registry_type": "npm",
+      "identifier": "@earnfi/mcp-server",
+      "version": "2.1.0",
+      "transport": {
+        "type": "streamable-http",
+        "url": "https://app.earnfi.fun/mcp"
+      }
+    }
+  ]
+}

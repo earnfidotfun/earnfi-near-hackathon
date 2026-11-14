@@ -1,0 +1,95 @@
+{
+  "$schema": "EarnFi sanitized platform export — allowlisted PHP + SPA source",
+  "repoName": "earnfi-near-hackathon",
+  "profile": "platform",
+  "includeGlobs": [
+    "docs/hackathon/**",
+    "examples/hackathon/**",
+    "packages/agent-client/**",
+    "packages/earnfi-mcp-server/**",
+    "scripts/hackathon/**",
+    "includes/ai-agent/**",
+    "includes/payments/**",
+    "includes/identity/**",
+    "includes/partner/**",
+    "includes/work-money/**",
+    "tests/x402-*.php"
+  ],
+  "includeFiles": [
+    "includes/work-api/class-work-rest-api.php",
+    "includes/class-database.php",
+    "includes/class-security.php",
+    "includes/class-earnfi-idempotency.php",
+    "public/hackathon-agent.html",
+    "public/js/utils/near-x402-signer.js",
+    "public/js/utils/evm-x402-signer.js",
+    "public/js/utils/multichain-auth.js",
+    "public/js/utils/earnfi-wallet-context.js",
+    "public/js/utils/earnfi-agent-integrator-copy.js",
+    "public/js/components/agent-marketplace.js",
+    "public/js/components/wallet-connect.js",
+    "public/js/agent-api-app.js"
+  ],
+  "excludeGlobs": [
+    "**/node_modules/**",
+    "**/.env",
+    "**/.env.*",
+    "**/dist/**",
+    "**/.git/**",
+    "**/wp-admin/**",
+    "**/wp-includes/**",
+    "**/wp-config*.php",
+    "**/*.sql",
+    "**/*.sql.gz",
+    "**/secrets/**",
+    "**/.agents/**",
+    "growl-fun.php",
+    "admin/**",
+    "packages/agent-client/node_modules/**",
+    "packages/earnfi-mcp-server/node_modules/**"
+  ],
+  "excludeFiles": [
+    "growl-fun.php",
+    "includes/class-admin-rest-api.php",
+    "includes/class-admin.php",
+    "includes/class-rest-api.php",
+    "includes/payments/class-earnfi-multichain-migrations.php",
+    "includes/payments/class-earnfi-payout-orchestrator.php",
+    "includes/ai-agent/class-agent-v2-rest-api.php",
+    "includes/ai-agent/class-agent-okx-rest-api.php",
+    "includes/work-api/class-work-v2-rest-api.php",
+    "includes/partner/class-partner-integrations-admin.php",
+    "includes/work-money/class-growl-hub-expansion.php",
+    "includes/work-money/class-growl-agent-order-webhook.php",
+    "includes/work-money/class-growl-balance-reconcile-service.php",
+    "includes/work-money/class-growl-allowance-service.php",
+    "includes/work-money/class-growl-said-feedback-queue.php",
+    "scripts/hackathon/export-manifest-php-slice.json"
+  ],
+  "contractCopies": [
+    { "from": "includes/data/earnfi-skill.md", "to": "contracts/skill.md" },
+    { "from": "includes/data/openapi-x402.json", "to": "contracts/openapi-x402.json" },
+    { "from": "includes/data/mcp-server-card.json", "to": "contracts/mcp-server-card.json" },
+    { "from": "includes/data/work-console.md", "to": "contracts/work-api.md" },
+    { "from": "includes/data/llms.txt", "to": "contracts/llms.txt" }
+  ],
+  "sanitizePatterns": [
+    {
+      "name": "private-key-block",
+      "regex": "-----BEGIN (?:RSA |EC )?PRIVATE KEY-----[\\s\\S]*?-----END (?:RSA |EC )?PRIVATE KEY-----",
+      "replace": "-----BEGIN PRIVATE KEY-----\n[REDACTED]\n-----END PRIVATE KEY-----"
+    },
+    {
+      "name": "bearer-token",
+      "regex": "Bearer\\s+[A-Za-z0-9._-]{20,}",
+      "replace": "Bearer [REDACTED]"
+    }
+  ],
+  "topicCommits": [
+    { "paths": ["docs/hackathon", "contracts", "examples/hackathon"], "message": "docs: NEAR hackathon — architecture and Work & Money layer" },
+    { "paths": ["includes"], "message": "feat: EarnFi Agent API, Work API, x402 payments (NEAR/Solvador), work-money services" },
+    { "paths": ["public"], "message": "feat: marketplace, wallet, NEAR x402 signer, agent API explorer" },
+    { "paths": ["packages"], "message": "feat: agent-client SDK and MCP server" },
+    { "paths": ["tests", "scripts/hackathon"], "message": "test: x402 filters and hackathon export tooling" }
+  ]
+}

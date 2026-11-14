@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EarnFi — Agent Work Console (Hackathon)</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e7ecf3; }
+    body { max-width: 960px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 1.35rem; }
+    label { display: block; font-size: 0.8rem; opacity: 0.85; margin-top: 12px; }
+    input, textarea, select { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 8px; border: 1px solid #334; background: #1a2332; color: inherit; }
+    textarea { min-height: 88px; }
+    button { margin-top: 16px; padding: 10px 16px; border-radius: 8px; border: none; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; }
+    button.secondary { background: #334155; margin-left: 8px; }
+    pre { background: #1a2332; padding: 12px; border-radius: 8px; overflow: auto; font-size: 12px; max-height: 280px; }
+    .grid { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+    @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+    .status { padding: 8px 12px; border-radius: 8px; background: #1e293b; margin-top: 12px; font-size: 0.9rem; }
+    a { color: #93c5fd; }
+    .note { font-size: 0.85rem; opacity: 0.8; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Agent → human work (NEAR hackathon console)</h1>
+  <p class="note">Live API only — no mocked payments. NEAR pay-in requires production rails enabled. Workers use the main EarnFi app. See repository <code>docs/hackathon/DEMO.md</code> and <a href="/skill.md">skill.md</a>.</p>
+
+  <label>API base</label>
+  <input id="apiBase" value="/api/ai-agent/v1" />
+
+  <div class="grid">
+    <div>
+      <label>Job title</label>
+      <input id="title" value="Port Harcourt business verification" />
+    </div>
+    <div>
+      <label>Reward per worker (USDC)</label>
+      <input id="reward" type="number" step="0.01" value="0.5" />
+    </div>
+  </div>
+
+  <label>Brief / instructions</label>
+  <textarea id="instructions">Verify the named business exists and is operating. Submit original photos, location confirmation, and a short factual report.</textarea>
+
+  <label>Network filter (optional header)</label>
+  <select id="networkFilter">
+    <option value="">All enabled accepts (Solana-first)</option>
+    <option value="near:mainnet">NEAR mainnet only</option>
+    <option value="eip155:8453">Base only</option>
+    <option value="solana:">Solana only</option>
+  </select>
+
+  <button type="button" id="quoteBtn">Request 402 quote</button>
+  <button type="button" class="secondary" id="capBtn">Load capabilities</button>
+
+  <div class="status" id="status">Idle</div>
+
+  <h2>402 / capabilities response</h2>
+  <pre id="out">{}</pre>
+
+  <h2>After payment (paste 200 JSON)</h2>
+  <textarea id="paidJson" placeholder='Paste funded job JSON: job_id, secret, submissions_url…'></textarea>
+  <button type="button" class="secondary" id="pollBtn">Poll submissions</button>
+  <pre id="pollOut">{}</pre>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const status = (t) => { $('status').textContent = t; };
+
+    async function requestQuote() {
+      const base = $('apiBase').value.replace(/\/$/, '');
+      const filter = $('networkFilter').value;
+      const body = {
+        title: $('title').value,
+        custom_instructions: $('instructions').value,
+        verification_method: 'manual_review',
+        slots: 1,
+        reward_per_user: parseFloat($('reward').value) || 0.5,
+        execution_mode: 'human',
+      };
+      status('POST jobs/manual (expect 402)…');
+      const headers = { 'Content-Type': 'application/json' };
+      if (filter) headers['X-Earnfi-Accepts-Filter'] = filter;
+      const res = await fetch(base + '/jobs/manual', { method: 'POST', headers, body: JSON.stringify(body) });
+      const text = await res.text();
+      let json;
+      try { json = JSON.parse(text); } catch { json = { raw: text }; }
+      $('out').textContent = JSON.stringify({ status: res.status, json }, null, 2);
+      status(res.status === 402 ? 'Quote received — sign NEAR (or chosen accept) and retry with PAYMENT-SIGNATURE' : 'HTTP ' + res.status);
+    }
+
+    async function loadCapabilities() {
+      const base = $('apiBase').value.replace(/\/$/, '');
+      status('GET x402/capabilities…');
+      const res = await fetch(base + '/x402/capabilities');
+      const json = await res.json().catch(() => ({}));
+      $('out').textContent = JSON.stringify({ status: res.status, json }, null, 2);
+      status('Capabilities loaded');
+    }
+
+    async function pollSubmissions() {
+      let paid;
+      try { paid = JSON.parse($('paidJson').value); } catch { status('Invalid paid JSON'); return; }
+      const jobId = paid.job_id || paid.data?.job_id;
+      const secret = paid.secret || paid.data?.secret;
+      if (!jobId || !secret) { status('Need job_id and secret in paid JSON'); return; }
+      const base = $('apiBase').value.replace(/\/$/, '');
+      const url = base + '/jobs/' + encodeURIComponent(jobId) + '/submissions?secret=' + encodeURIComponent(secret);
+      status('GET submissions…');
+      const res = await fetch(url);
+      const json = await res.json().catch(() => ({}));
+      $('pollOut').textContent = JSON.stringify({ status: res.status, json }, null, 2);
+      status('Submissions HTTP ' + res.status);
+    }
+
+    $('quoteBtn').addEventListener('click', () => requestQuote().catch((e) => status(String(e)));
+    $('capBtn').addEventListener('click', () => loadCapabilities().catch((e) => status(String(e)));
+    $('pollBtn').addEventListener('click', () => pollSubmissions().catch((e) => status(String(e)));
+  </script>
+</body>
+</html>

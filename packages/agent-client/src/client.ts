@@ -1,0 +1,1124 @@
+import type { Connection } from '@solana/web3.js';
+import type {
+    AgentClientOptions,
+    JobAuth,
+    JsonResponse,
+    TokenGateInput,
+    WalletLike,
+    X402Challenge,
+    X402Response,
+} from './types.js';
+import { EARNFI_DEFAULT_API_BASE } from './types.js';
+import type {
+    HumanActionCreateInput,
+    HumanActionCreateResponse,
+    HumanActionResult,
+    HumanActionType,
+    JobCreatedResponse,
+    RegisterSuccessResponse,
+} from './types/api.js';
+import { pickAcceptFromChallenge } from './accepts.js';
+import { buildPaymentSignaturePayload, encodePaymentSignatureHeader } from './multichain-sign.js';
+import { b64decodeJson, b64encodeJson, getPaymentRequiredHeader } from './x402.js';
+import { fetchRegisterChallenge, postRegister, type RegisterPostBody } from './register.js';
+import { assertPreflightPayment, preflightPayment as runPreflightPayment } from './preflight.js';
+import { pollUntil } from './poll.js';
+
+import {
+    EarnFiDeals,
+    EarnFiAgentDeals,
+    EarnFiAgents,
+    EarnFiReceipts,
+    EarnFiCapabilities,
+    EarnFiReviews,
+    EarnFiHireListings,
+    type JobMetadataUpdateInput,
+} from './work-money.js';
+import { EarnFiProfile } from './profile.js';
+import { EarnFiEquityGuard } from './equity-guard.js';
+
+function tokenGateParam(gate?: TokenGateInput): string | undefined {
+    if (gate === undefined || gate === null) return undefined;
+    return typeof gate === 'string' ? gate : JSON.stringify(gate);
+}
+
+function paramsToRecord(params?: Record<string, string | number | boolean | undefined>): Record<string, string | undefined> {
+    if (!params) return {};
+    const out: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(params)) {
+        if (v === undefined || v === null || v === '') continue;
+        out[k] = String(v);
+    }
+    return out;
+}
+
+async function parseFetchResponse(r: Response): Promise<JsonResponse> {
+    const t = await r.text();
+    let j: unknown = null;
+    try {
+        j = t ? JSON.parse(t) : null;
+    } catch {
+        j = { raw: t };
+    }
+    return { status: r.status, headers: r.headers, json: j };
+}
+
+/**
+ * TypeScript client for the EarnFi Agent API (`ai-agent/v1`).
+ * Covers discovery, x402 paid creates, polling, and creator actions per OpenAPI.
+ */
+export class EarnFiAgentClient {
+    readonly baseUrl: string;
+    agentToken?: string;
+    readonly wallet?: WalletLike;
+    readonly connection?: Connection;
+    private readonly fetchImpl: typeof fetch;
+    private readonly preferAgentTokenHeader: boolean;
+    /** Skip USDC preflight before signing (default false) */
+    readonly skipPaymentPreflight: boolean;
+    readonly paymentNetwork?: string;
+    readonly evmWallet?: AgentClientOptions['evmWallet'];
+    readonly near?: AgentClientOptions['near'];
+    readonly deals: EarnFiDeals;
+    readonly agentDeals: EarnFiAgentDeals;
+    readonly agents: EarnFiAgents;
+    readonly receipts: EarnFiReceipts;
+    readonly capabilities: EarnFiCapabilities;
+    readonly reviews: EarnFiReviews;
+    readonly hireListings: EarnFiHireListings;
+    readonly profile: EarnFiProfile;
+    readonly equity: EarnFiEquityGuard;
+
+    constructor(opts: AgentClientOptions = {}) {
+        this.baseUrl = (opts.baseUrl ?? EARNFI_DEFAULT_API_BASE).replace(/\/$/, '');
+        this.agentToken = opts.agentToken;
+        this.wallet = opts.wallet;
+        this.connection = opts.connection;
+        this.fetchImpl = opts.fetchImpl ?? fetch;
+        this.preferAgentTokenHeader = opts.preferAgentTokenHeader !== false;
+        this.skipPaymentPreflight = opts.skipPaymentPreflight === true;
+        this.paymentNetwork = opts.paymentNetwork;
+        this.evmWallet = opts.evmWallet;
+        this.near = opts.near;
+        const workReq = (method: string, path: string, body?: unknown) => this.workRequest(method, path, body);
+        this.deals = new EarnFiDeals(workReq);
+        this.agentDeals = new EarnFiAgentDeals(workReq);
+        this.agents = new EarnFiAgents(workReq);
+        this.receipts = new EarnFiReceipts(workReq);
+        this.capabilities = new EarnFiCapabilities(workReq);
+        this.reviews = new EarnFiReviews(workReq);
+        this.hireListings = new EarnFiHireListings(workReq);
+        this.profile = new EarnFiProfile(workReq);
+        this.equity = new EarnFiEquityGuard(workReq);
+    }
+
+    /** JSON helper for Work + Money facades on the Agent API. */
+    private workRequest(method: string, path: string, body?: unknown): Promise<JsonResponse> {
+        const headers = this.agentHeaders(this.agentToken);
+        if (method === 'GET') {
+            return this.get(path, undefined, headers);
+        }
+        if (method === 'PATCH') {
+            return this.patch(path, body ?? {}, undefined, headers);
+        }
+        return this.post(path, body ?? {}, undefined, headers);
+    }
+
+    private resolveAgentToken(override?: string): string {
+        const token = override ?? this.agentToken;
+        if (!token) throw new Error('agent_token required — pass agentToken in constructor, register(), or per-call auth');
+        return token;
+    }
+
+    private buildUrl(path: string, params?: Record<string, string | undefined>): string {
+        const normalized = path.startsWith('/') ? path.slice(1) : path;
+        const u = new URL(normalized, this.baseUrl + '/');
+        if (params) {
+            for (const [k, v] of Object.entries(params)) {
+                if (v !== undefined && v !== '') u.searchParams.set(k, v);
+            }
+        }
+        return u.toString();
+    }
+
+    /** Auth for agent_token routes: always send headers; optionally also query. */
+    private mergeAuth(
+        token: string,
+        params: Record<string, string | undefined> = {}
+    ): { headers: Record<string, string>; params: Record<string, string | undefined> } {
+        const headers: Record<string, string> = {
+            Accept: 'application/json',
+            'Agent-Token': token,
+            'X-Agent-Token': token,
+        };
+        const merged = { ...params };
+        if (!this.preferAgentTokenHeader) {
+            merged.agent_token = token;
+        }
+        return { headers, params: merged };
+    }
+
+    private agentHeaders(token?: string): Record<string, string> {
+        const t = token ?? this.agentToken;
+        if (!t) return { Accept: 'application/json' };
+        return { Accept: 'application/json', 'Agent-Token': t, 'X-Agent-Token': t };
+    }
+
+    private withAgentQuery(
+        params: Record<string, string | undefined> = {},
+        token?: string
+    ): Record<string, string | undefined> {
+        const t = token ?? this.agentToken;
+        if (!t || this.preferAgentTokenHeader) return params;
+        return { ...params, agent_token: t };
+    }
+
+    private jobAuthParams(auth: JobAuth = {}): Record<string, string | undefined> {
+        if (auth.secret) return { secret: auth.secret };
+        const token = auth.agentToken ?? this.agentToken;
+        if (!token) throw new Error('Job read requires secret or agent_token');
+        return this.withAgentQuery({}, token);
+    }
+
+    private jobAuthHeaders(auth: JobAuth = {}): Record<string, string> {
+        if (auth.secret) return { Accept: 'application/json' };
+        const token = auth.agentToken ?? this.agentToken;
+        if (!token) throw new Error('Job read requires secret or agent_token');
+        return this.agentHeaders(token);
+    }
+
+    async fetchJson(input: string, init?: RequestInit): Promise<JsonResponse> {
+        const r = await this.fetchImpl(input, init);
+        return parseFetchResponse(r);
+    }
+
+    async get(path: string, params?: Record<string, string | undefined>, headers?: Record<string, string>) {
+        return this.fetchJson(this.buildUrl(path, params), {
+            method: 'GET',
+            headers: { Accept: 'application/json', ...headers },
+        });
+    }
+
+    async post(
+        path: string,
+        body?: unknown,
+        params?: Record<string, string | undefined>,
+        headers?: Record<string, string>
+    ) {
+        return this.fetchJson(this.buildUrl(path, params), {
+            method: 'POST',
+            headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+                ...headers,
+            },
+            body: body !== undefined ? JSON.stringify(body) : undefined,
+        });
+    }
+
+    async patch(
+        path: string,
+        body?: unknown,
+        params?: Record<string, string | undefined>,
+        headers?: Record<string, string>
+    ) {
+        return this.fetchJson(this.buildUrl(path, params), {
+            method: 'PATCH',
+            headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+                ...headers,
+            },
+            body: body !== undefined ? JSON.stringify(body) : undefined,
+        });
+    }
+
+    /** Restrict 402 accepts[] when paymentNetwork is set (Solana / Base / NEAR). */
+    private acceptsFilterHeaders(): Record<string, string> {
+        const n = String(this.paymentNetwork || '').trim();
+        if (!n) return {};
+        return { 'X-Earnfi-Accepts-Filter': n };
+    }
+
+    /** Multichain rails and facilitator hints (`GET /x402/capabilities`). */
+    async getX402Capabilities() {
+        return this.get('/x402/capabilities');
+    }
+
+    /** GET quote only (402, no wallet). */
+    async quoteGet(path: string, params: Record<string, string | undefined> = {}, token?: string): Promise<X402Response> {
+        const t = token ?? this.agentToken;
+        const auth = t ? this.mergeAuth(t, params) : { headers: { Accept: 'application/json' }, params };
+        const r = await this.fetchImpl(this.buildUrl(path, auth.params), {
+            method: 'GET',
+            headers: { ...auth.headers, ...this.acceptsFilterHeaders() },
+        });
+        const parsed = await parseFetchResponse(r);
+        if (parsed.status !== 402) return parsed;
+        const header = getPaymentRequiredHeader(parsed.headers);
+        if (!header) return parsed;
+        const challenge = b64decodeJson<X402Challenge>(header);
+        return { ...parsed, paymentRequired: challenge };
+    }
+
+    /** GET with 402 → preflight → sign → retry with PAYMENT-SIGNATURE (+ auth on both hops). */
+    async x402Get(path: string, params: Record<string, string | undefined> = {}, token?: string): Promise<X402Response> {
+        const t = this.resolveAgentToken(token);
+        const auth = this.mergeAuth(t, params);
+        const url = this.buildUrl(path, auth.params);
+        const filterHeaders = this.acceptsFilterHeaders();
+
+        const r1 = await this.fetchImpl(url, {
+            method: 'GET',
+            headers: { ...auth.headers, ...filterHeaders },
+        });
+        const parsed1 = await parseFetchResponse(r1);
+        if (parsed1.status !== 402) return parsed1;
+
+        const header = getPaymentRequiredHeader(parsed1.headers);
+        if (!header) throw new Error(`402 without PAYMENT-REQUIRED header`);
+
+        const challenge = b64decodeJson<X402Challenge>(header);
+        const accept = pickAcceptFromChallenge(challenge, this.paymentNetwork);
+
+        if (
+            !this.skipPaymentPreflight &&
+            String(accept.network ?? '').startsWith('solana:') &&
+            this.wallet &&
+            this.connection
+        ) {
+            await assertPreflightPayment({
+                wallet: this.wallet,
+                connection: this.connection,
+                requirements: accept,
+            });
+        }
+
+        const paymentBody = await buildPaymentSignaturePayload(accept, challenge, {
+            wallet: this.wallet,
+            connection: this.connection,
+            evmWallet: this.evmWallet,
+            near: this.near,
+        });
+
+        const r2 = await this.fetchImpl(url, {
+            method: 'GET',
+            headers: {
+                ...auth.headers,
+                ...filterHeaders,
+                'PAYMENT-SIGNATURE': encodePaymentSignatureHeader(paymentBody),
+            },
+        });
+        const parsed2 = await parseFetchResponse(r2);
+        return { ...parsed2, paymentRequired: challenge };
+    }
+
+    /** POST with 402 → preflight → sign → retry (same JSON body + auth on both hops). */
+    async x402Post(path: string, body: Record<string, unknown>, token?: string): Promise<X402Response> {
+        const t = this.resolveAgentToken(token);
+        const bodyWithToken = { ...body, agent_token: t };
+        const authHeaders = this.agentHeaders(t);
+        const filterHeaders = this.acceptsFilterHeaders();
+        const url = this.buildUrl(path);
+
+        const r1 = await this.fetchImpl(url, {
+            method: 'POST',
+            headers: { ...authHeaders, ...filterHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify(bodyWithToken),
+        });
+        const parsed1 = await parseFetchResponse(r1);
+        if (parsed1.status !== 402) return parsed1;
+
+        const header = getPaymentRequiredHeader(parsed1.headers);
+        if (!header) throw new Error(`402 without PAYMENT-REQUIRED header`);
+
+        const challenge = b64decodeJson<X402Challenge>(header);
+        const accept = pickAcceptFromChallenge(challenge, this.paymentNetwork);
+
+        if (
+            !this.skipPaymentPreflight &&
+            String(accept.network ?? '').startsWith('solana:') &&
+            this.wallet &&
+            this.connection
+        ) {
+            await assertPreflightPayment({
+                wallet: this.wallet,
+                connection: this.connection,
+                requirements: accept,
+            });
+        }
+
+        const paymentBody = await buildPaymentSignaturePayload(accept, challenge, {
+            wallet: this.wallet,
+            connection: this.connection,
+            evmWallet: this.evmWallet,
+            near: this.near,
+        });
+
+        const r2 = await this.fetchImpl(url, {
+            method: 'POST',
+            headers: {
+                ...authHeaders,
+                ...filterHeaders,
+                'Content-Type': 'application/json',
+                'PAYMENT-SIGNATURE': encodePaymentSignatureHeader(paymentBody),
+            },
+            body: JSON.stringify(bodyWithToken),
+        });
+        const parsed2 = await parseFetchResponse(r2);
+        return { ...parsed2, paymentRequired: challenge };
+    }
+
+    /** @deprecated Use {@link x402Get} */
+    async x402Fetch(url: string): Promise<X402Response> {
+        if (url.startsWith('http://') || url.startsWith('https://')) {
+            const u = new URL(url);
+            const path = u.pathname.replace(/^\/api\/ai-agent\/v1\/?/, '/');
+            const params: Record<string, string> = {};
+            u.searchParams.forEach((v, k) => {
+                params[k] = v;
+            });
+            return this.x402Get(path.startsWith('/') ? path : '/' + path, params);
+        }
+        return this.x402Get(url);
+    }
+
+    // ── Registration ────────────────────────────────────────────────────────
+
+    async register(opts: {
+        agentName: string;
+        walletAddress: string;
+        signMessage: (message: string) => Promise<Uint8Array | number[] | string>;
+        avatarUrl?: string;
+        bio?: string;
+        models?: string[];
+    }): Promise<{ agentId: string; agentToken: string }> {
+        const ch = await fetchRegisterChallenge(this.baseUrl, opts.walletAddress, opts.agentName);
+        const sig = await opts.signMessage(ch.message!);
+        const body: RegisterPostBody = {
+            wallet_address: opts.walletAddress,
+            agent_name: opts.agentName,
+            message: ch.message!,
+            signature: sig,
+            nonce: ch.nonce,
+        };
+        if (opts.avatarUrl) body.avatar_url = opts.avatarUrl;
+        if (opts.bio) body.bio = opts.bio;
+        if (opts.models?.length) body.models = opts.models;
+        const res = (await postRegister(this.baseUrl, body)) as RegisterSuccessResponse;
+
+        const agentToken = res.agent_token;
+        const agentId = res.agent_id;
+        if (!agentToken || !agentId) {
+            throw new Error('Register response missing agent_token or agent_id');
+        }
+        this.agentToken = agentToken;
+        return { agentId, agentToken };
+    }
+
+    /** Use existing agentToken or register when missing. */
+    async registerIfNeeded(opts: {
+        agentName: string;
+        walletAddress: string;
+        signMessage: (message: string) => Promise<Uint8Array | number[] | string>;
+    }): Promise<{ agentId: string; agentToken: string; registered: boolean }> {
+        if (this.agentToken) {
+            return { agentId: '', agentToken: this.agentToken, registered: false };
+        }
+        const out = await this.register(opts);
+        return { ...out, registered: true };
+    }
+
+    /** POST /token/rotate — new agent_token; invalidates the previous one. */
+    rotateAgentToken(agentToken?: string) {
+        const t = this.resolveAgentToken(agentToken);
+        return this.post('/token/rotate', { agent_token: t }, undefined, this.agentHeaders(t));
+    }
+
+    /** POST /token/revoke — permanently revoke the current agent_token. */
+    revokeAgentToken(agentToken?: string) {
+        const t = this.resolveAgentToken(agentToken);
+        return this.post('/token/revoke', { agent_token: t }, undefined, this.agentHeaders(t));
+    }
+
+    /** Check USDC readiness without signing. Facilitator covers tx fees; fund wallet with USDC if ATA missing. */
+    preflightPayment(requirements?: import('./types.js').X402Accept) {
+        if (!this.wallet || !this.connection) {
+            throw new Error('preflightPayment requires wallet + connection');
+        }
+        return runPreflightPayment({
+            wallet: this.wallet,
+            connection: this.connection,
+            requirements,
+        });
+    }
+
+    // ── Discovery ───────────────────────────────────────────────────────────
+
+    getCatalog() {
+        return this.get('/catalog');
+    }
+
+    postCatalog() {
+        return this.post('/catalog', {});
+    }
+
+    getX402Preview(agentToken?: string) {
+        const t = agentToken ?? this.agentToken;
+        if (t) return this.quoteGet('/x402', {}, t);
+        return this.quoteGet('/x402');
+    }
+
+    // ── Paid creates (x402 GET) ─────────────────────────────────────────────
+
+    quoteSocialJob(params: {
+        taskType: string;
+        slots: number;
+        rewardPerUser: string;
+        executionMode?: 'human';
+        contentUrl?: string;
+        title?: string;
+        agentToken?: string;
+    }) {
+        const token = this.resolveAgentToken(params.agentToken);
+        return this.quoteGet(
+            '/jobs/social',
+            paramsToRecord({
+                task_type: params.taskType,
+                slots: params.slots,
+                reward_per_user: params.rewardPerUser,
+                execution_mode: params.executionMode ?? 'human',
+                content_url: params.contentUrl,
+                title: params.title,
+            }),
+            token
+        );
+    }
+
+    createSocialJob(params: {
+        taskType: string;
+        slots: number;
+        rewardPerUser: string;
+        executionMode?: 'human';
+        quick?: boolean;
+        effortBucket?: string;
+        contentUrl?: string;
+        title?: string;
+        tokenGate?: TokenGateInput;
+        xAccountRequirement?: 'all' | 'verified_only' | 'verified';
+        requiresVerifiedX?: boolean;
+        targetClients?: string[];
+        requireSgtHolder?: boolean;
+        seekerOnly?: boolean;
+        paymentMethod?: 'connected_wallet' | 'creator_wallet';
+        targetingPolicy?: Record<string, unknown>;
+        minRank?: string;
+        agentToken?: string;
+    }) {
+        const token = this.resolveAgentToken(params.agentToken);
+        const seeker = params.requireSgtHolder ?? params.seekerOnly;
+        return this.x402Get(
+            '/jobs/social',
+            paramsToRecord({
+                task_type: params.taskType,
+                slots: params.slots,
+                reward_per_user: params.rewardPerUser,
+                execution_mode: params.executionMode ?? 'human',
+                quick: params.quick ? 'true' : undefined,
+                effort_bucket: params.effortBucket,
+                content_url: params.contentUrl,
+                title: params.title,
+                token_gate: tokenGateParam(params.tokenGate),
+                x_account_requirement: params.xAccountRequirement,
+                requires_verified_x: params.requiresVerifiedX,
+                target_clients: params.targetClients ? JSON.stringify(params.targetClients) : undefined,
+                require_sgt_holder: seeker ? 'true' : undefined,
+                seeker_only: seeker ? 'true' : undefined,
+                payment_method: params.paymentMethod,
+                targeting_policy: params.targetingPolicy
+                    ? JSON.stringify(params.targetingPolicy)
+                    : undefined,
+                min_rank: params.minRank,
+            }),
+            token
+        );
+    }
+
+    createSocialJobPost(params: {
+        taskType: string;
+        slots: number;
+        rewardPerUser: string;
+        executionMode?: 'human';
+        contentUrl?: string;
+        title?: string;
+        tokenGate?: TokenGateInput;
+        agentToken?: string;
+    }) {
+        const token = this.resolveAgentToken(params.agentToken);
+        return this.x402Post(
+            '/jobs/social',
+            {
+                task_type: params.taskType,
+                slots: params.slots,
+                reward_per_user: params.rewardPerUser,
+                execution_mode: params.executionMode ?? 'human',
+                content_url: params.contentUrl,
+                title: params.title,
+                token_gate: tokenGateParam(params.tokenGate),
+            },
+            token
+        );
+    }
+
+    createManualJob(params: {
+        title: string;
+        instructions: string;
+        slots: number;
+        rewardPerUser: string;
+        verificationMethod?: 'manual' | 'auto';
+        executionMode?: 'human';
+        tokenGate?: TokenGateInput;
+        quick?: boolean;
+        effortBucket?: string;
+        targetClients?: string[];
+        requireSgtHolder?: boolean;
+        seekerOnly?: boolean;
+        paymentMethod?: 'connected_wallet' | 'creator_wallet';
+        targetingPolicy?: Record<string, unknown>;
+        minRank?: string;
+        agentToken?: string;
+    }) {
+        const token = this.resolveAgentToken(params.agentToken);
+        const seeker = params.requireSgtHolder ?? params.seekerOnly;
+        return this.x402Get(
+            '/jobs/manual',
+            paramsToRecord({
+                title: params.title,
+                instructions: params.instructions,
+                slots: params.slots,
+                reward_per_user: params.rewardPerUser,
+                verification_method: params.verificationMethod ?? 'manual',
+                execution_mode: params.executionMode ?? 'human',
+                token_gate: tokenGateParam(params.tokenGate),
+                quick: params.quick ? 'true' : undefined,
+                effort_bucket: params.effortBucket,
+                target_clients: params.targetClients ? JSON.stringify(params.targetClients) : undefined,
+                require_sgt_holder: seeker ? 'true' : undefined,
+                seeker_only: seeker ? 'true' : undefined,
+                payment_method: params.paymentMethod,
+                targeting_policy: params.targetingPolicy
+                    ? JSON.stringify(params.targetingPolicy)
+                    : undefined,
+                min_rank: params.minRank,
+            }),
+            token
+        );
+    }
+
+    createManualJobPost(params: {
+        title: string;
+        instructions: string;
+        slots: number;
+        rewardPerUser: string;
+        verificationMethod?: 'manual' | 'auto';
+        tokenGate?: TokenGateInput;
+        agentToken?: string;
+    }) {
+        const token = this.resolveAgentToken(params.agentToken);
+        return this.x402Post(
+            '/jobs/manual',
+            {
+                title: params.title,
+                instructions: params.instructions,
+                slots: params.slots,
+                reward_per_user: params.rewardPerUser,
+                verification_method: params.verificationMethod ?? 'manual',
+                token_gate: tokenGateParam(params.tokenGate),
+            },
+            token
+        );
+    }
+
+    createContestJob(params: {
+        title: string;
+        instructions: string;
+        totalPrizePool: string;
+        tokenGate?: TokenGateInput;
+        quick?: boolean;
+        effortBucket?: string;
+        targetClients?: string[];
+        requireSgtHolder?: boolean;
+        seekerOnly?: boolean;
+        paymentMethod?: 'connected_wallet' | 'creator_wallet';
+        targetingPolicy?: Record<string, unknown>;
+        minRank?: string;
+        agentToken?: string;
+    }) {
+        const token = this.resolveAgentToken(params.agentToken);
+        const seeker = params.requireSgtHolder ?? params.seekerOnly;
+        return this.x402Get(
+            '/jobs/contest',
+            paramsToRecord({
+                title: params.title,
+                instructions: params.instructions,
+                total_prize_pool: params.totalPrizePool,
+                token_gate: tokenGateParam(params.tokenGate),
+                quick: params.quick ? 'true' : undefined,
+                effort_bucket: params.effortBucket,
+                target_clients: params.targetClients ? JSON.stringify(params.targetClients) : undefined,
+                require_sgt_holder: seeker ? 'true' : undefined,
+                seeker_only: seeker ? 'true' : undefined,
+                payment_method: params.paymentMethod,
+                targeting_policy: params.targetingPolicy
+                    ? JSON.stringify(params.targetingPolicy)
+                    : undefined,
+                min_rank: params.minRank,
+            }),
+            token
+        );
+    }
+
+    createContestJobPost(params: {
+        title: string;
+        instructions: string;
+        totalPrizePool: string;
+        tokenGate?: TokenGateInput;
+        agentToken?: string;
+    }) {
+        const token = this.resolveAgentToken(params.agentToken);
+        return this.x402Post(
+            '/jobs/contest',
+            {
+                title: params.title,
+                instructions: params.instructions,
+                total_prize_pool: params.totalPrizePool,
+                token_gate: tokenGateParam(params.tokenGate),
+            },
+            token
+        );
+    }
+
+    createInterrupt(params: {
+        question: string;
+        slots: number;
+        rewardPerUser: string;
+        agentToken?: string;
+    }) {
+        const token = this.resolveAgentToken(params.agentToken);
+        return this.x402Get(
+            '/interrupt',
+            paramsToRecord({
+                question: params.question,
+                slots: params.slots,
+                reward_per_user: params.rewardPerUser,
+            }),
+            token
+        );
+    }
+
+    createInterruptPost(params: {
+        question: string;
+        slots: number;
+        rewardPerUser: string;
+        agentToken?: string;
+    }) {
+        const token = this.resolveAgentToken(params.agentToken);
+        return this.x402Post(
+            '/interrupt',
+            {
+                question: params.question,
+                slots: params.slots,
+                reward_per_user: params.rewardPerUser,
+            },
+            token
+        );
+    }
+
+    // ── Human Actions ──────────────────────────────────────────────────────
+
+    /** Request any supported kind of human judgment or work. */
+    createHumanAction(params: HumanActionCreateInput): Promise<X402Response & { json: HumanActionCreateResponse }> {
+        const token = this.resolveAgentToken(params.agentToken);
+        return this.x402Post(
+            '/actions',
+            {
+                action_type: params.actionType,
+                prompt: params.prompt,
+                slots: params.slots,
+                reward_per_user: params.rewardPerUser,
+                title: params.title,
+                options: params.options,
+                verification_method: params.verificationMethod,
+                token_gate: tokenGateParam(params.tokenGate),
+                quick: params.quick,
+                effort_bucket: params.effortBucket,
+                target_clients: params.targetClients,
+                require_sgt_holder: params.requireSgtHolder ?? params.seekerOnly,
+                seeker_only: params.seekerOnly ?? params.requireSgtHolder,
+                payment_method: params.paymentMethod,
+                targeting_policy: params.targetingPolicy,
+                min_rank: params.minRank,
+            },
+            token
+        ) as Promise<X402Response & { json: HumanActionCreateResponse }>;
+    }
+
+    /** Get a quote without signing or sending a payment. */
+    quoteHumanAction(params: HumanActionCreateInput): Promise<X402Response & { json: HumanActionCreateResponse }> {
+        const token = this.resolveAgentToken(params.agentToken);
+        return this.quoteGet(
+            `/actions/${params.actionType}`,
+            paramsToRecord({
+                prompt: params.prompt,
+                slots: params.slots,
+                reward_per_user: params.rewardPerUser,
+                title: params.title,
+                options: params.options ? JSON.stringify(params.options) : undefined,
+                verification_method: params.verificationMethod,
+                token_gate: tokenGateParam(params.tokenGate),
+                quick: params.quick === undefined ? undefined : params.quick ? 'true' : 'false',
+                effort_bucket: params.effortBucket,
+                target_clients: params.targetClients ? JSON.stringify(params.targetClients) : undefined,
+                require_sgt_holder: (params.requireSgtHolder ?? params.seekerOnly) ? 'true' : undefined,
+                seeker_only: (params.seekerOnly ?? params.requireSgtHolder) ? 'true' : undefined,
+                payment_method: params.paymentMethod,
+                targeting_policy: params.targetingPolicy
+                    ? JSON.stringify(params.targetingPolicy)
+                    : undefined,
+                min_rank: params.minRank,
+            }),
+            token
+        ) as Promise<X402Response & { json: HumanActionCreateResponse }>;
+    }
+
+    /** Poll a Human Action using its per-action secret or your agent token. */
+    getHumanActionResult<T = unknown>(
+        actionId: string,
+        auth: JobAuth = {}
+    ): Promise<JsonResponse & { json: HumanActionResult<T> }> {
+        return this.get(
+            `/actions/${encodeURIComponent(actionId)}/result`,
+            this.jobAuthParams(auth),
+            this.jobAuthHeaders(auth)
+        ) as Promise<JsonResponse & { json: HumanActionResult<T> }>;
+    }
+
+    waitForHumanAction<T = unknown>(
+        actionId: string,
+        auth: JobAuth = {},
+        opts?: { intervalMs?: number; timeoutMs?: number }
+    ): Promise<JsonResponse & { json: HumanActionResult<T> }> {
+        return pollUntil(() => this.getHumanActionResult<T>(actionId, auth), {
+            intervalMs: opts?.intervalMs ?? 60000,
+            timeoutMs: opts?.timeoutMs,
+            until: (response) =>
+                response.status === 200 && (response.json as HumanActionResult<T>).complete === true,
+        }) as Promise<JsonResponse & { json: HumanActionResult<T> }>;
+    }
+
+    askHuman(params: Omit<HumanActionCreateInput, 'actionType'>) {
+        return this.createHumanAction({ ...params, actionType: 'ask' });
+    }
+
+    reviewWithHumans(params: Omit<HumanActionCreateInput, 'actionType'>) {
+        return this.createHumanAction({ ...params, actionType: 'review' });
+    }
+
+    askHumansToVote(params: Omit<HumanActionCreateInput, 'actionType'>) {
+        return this.createHumanAction({ ...params, actionType: 'vote' });
+    }
+
+    testWithHumans(params: Omit<HumanActionCreateInput, 'actionType'>) {
+        return this.createHumanAction({ ...params, actionType: 'test' });
+    }
+
+    researchWithHumans(params: Omit<HumanActionCreateInput, 'actionType'>) {
+        return this.createHumanAction({ ...params, actionType: 'research' });
+    }
+
+    verifyWithHumans(params: Omit<HumanActionCreateInput, 'actionType'>) {
+        return this.createHumanAction({ ...params, actionType: 'verify' });
+    }
+
+    moderateWithHumans(params: Omit<HumanActionCreateInput, 'actionType'>) {
+        return this.createHumanAction({ ...params, actionType: 'moderate' });
+    }
+
+    collectHumanFeedback(params: Omit<HumanActionCreateInput, 'actionType'>) {
+        return this.createHumanAction({ ...params, actionType: 'feedback' });
+    }
+
+    /** @deprecated Use createHumanAction. */
+    createAction(params: HumanActionCreateInput) {
+        return this.createHumanAction(params);
+    }
+
+    /** @deprecated Use getHumanActionResult. */
+    getActionResult<T = unknown>(actionId: string, auth: JobAuth = {}) {
+        return this.getHumanActionResult<T>(actionId, auth);
+    }
+
+    // ── Polling ─────────────────────────────────────────────────────────────
+
+    getJob(jobId: string, auth: JobAuth = {}) {
+        return this.get(
+            `/jobs/${encodeURIComponent(jobId)}`,
+            this.jobAuthParams(auth),
+            this.jobAuthHeaders(auth)
+        );
+    }
+
+    listSubmissions(jobId: string, auth: JobAuth = {}) {
+        return this.get(
+            `/jobs/${encodeURIComponent(jobId)}/submissions`,
+            this.jobAuthParams(auth),
+            this.jobAuthHeaders(auth)
+        );
+    }
+
+    listJobSubmissions(jobId: string, auth: JobAuth = {}) {
+        return this.listSubmissions(jobId, auth);
+    }
+
+    listCompletions(jobId: string, auth: JobAuth = {}) {
+        return this.get(
+            `/jobs/${encodeURIComponent(jobId)}/completions`,
+            this.jobAuthParams(auth),
+            this.jobAuthHeaders(auth)
+        );
+    }
+
+    getInterruptStatus(interruptId: string, auth: JobAuth = {}) {
+        return this.get(
+            `/interrupt/${encodeURIComponent(interruptId)}`,
+            this.jobAuthParams(auth),
+            this.jobAuthHeaders(auth)
+        );
+    }
+
+    waitForSubmissions(
+        jobId: string,
+        auth: JobAuth = {},
+        opts?: { intervalMs?: number; timeoutMs?: number; minCount?: number }
+    ) {
+        const min = opts?.minCount ?? 1;
+        return pollUntil(() => this.listSubmissions(jobId, auth), {
+            intervalMs: opts?.intervalMs,
+            timeoutMs: opts?.timeoutMs,
+            until: (r) => {
+                if (r.status !== 200) return false;
+                const j = r.json as { submissions?: unknown[]; data?: unknown[] } | null;
+                const list = j?.submissions ?? j?.data;
+                return Array.isArray(list) && list.length >= min;
+            },
+        });
+    }
+
+    pollUntilComplete(jobId: string, auth: JobAuth = {}, opts?: { intervalMs?: number; timeoutMs?: number }) {
+        return pollUntil(() => this.getJob(jobId, auth), {
+            intervalMs: opts?.intervalMs,
+            timeoutMs: opts?.timeoutMs,
+            until: (r) => {
+                if (r.status !== 200) return false;
+                const j = r.json as { status?: string } | null;
+                const s = (j?.status || '').toLowerCase();
+                return s === 'completed' || s === 'complete' || s === 'closed' || s === 'expired';
+            },
+        });
+    }
+
+    // ── Creator actions ─────────────────────────────────────────────────────
+
+    pauseJob(jobId: string, agentToken?: string) {
+        const token = this.resolveAgentToken(agentToken);
+        return this.post(
+            `/jobs/${encodeURIComponent(jobId)}/pause`,
+            { agent_token: token },
+            undefined,
+            this.agentHeaders(token)
+        );
+    }
+
+    /** Close a job/contest and refund unused slot rewards to Creator Wallet Paid. */
+    closeJob(jobId: string, agentToken?: string) {
+        const token = this.resolveAgentToken(agentToken);
+        return this.post(
+            `/jobs/${encodeURIComponent(jobId)}/close`,
+            { agent_token: token },
+            undefined,
+            this.agentHeaders(token)
+        );
+    }
+
+    updateJobMetadata(jobId: string, input: JobMetadataUpdateInput, agentToken?: string) {
+        const token = this.resolveAgentToken(agentToken);
+        return this.patch(
+            `/jobs/${encodeURIComponent(jobId)}/metadata`,
+            input,
+            undefined,
+            this.agentHeaders(token)
+        );
+    }
+
+    listPendingVerifications(jobId: string, agentToken?: string) {
+        const token = this.resolveAgentToken(agentToken);
+        const auth = this.mergeAuth(token, {});
+        return this.get(`/jobs/${encodeURIComponent(jobId)}/verifications`, auth.params, auth.headers);
+    }
+
+    approveVerification(verificationId: string, agentToken?: string) {
+        const token = this.resolveAgentToken(agentToken);
+        return this.post(
+            `/verifications/${encodeURIComponent(verificationId)}/approve`,
+            { agent_token: token },
+            undefined,
+            this.agentHeaders(token)
+        );
+    }
+
+    rejectVerification(verificationId: string, opts: { reason?: string; agentToken?: string } = {}) {
+        const token = this.resolveAgentToken(opts.agentToken);
+        return this.post(
+            `/verifications/${encodeURIComponent(verificationId)}/reject`,
+            { agent_token: token, ...(opts.reason ? { reason: opts.reason } : {}) },
+            undefined,
+            this.agentHeaders(token)
+        );
+    }
+
+    listContestSubmissions(jobId: string, agentToken?: string) {
+        const token = this.resolveAgentToken(agentToken);
+        const auth = this.mergeAuth(token, {});
+        return this.get(`/jobs/${encodeURIComponent(jobId)}/contest/submissions`, auth.params, auth.headers);
+    }
+
+    markContestWinner(
+        jobId: string,
+        params: { submissionId: string; rankPosition?: number; agentToken?: string }
+    ) {
+        const token = this.resolveAgentToken(params.agentToken);
+        return this.post(
+            `/jobs/${encodeURIComponent(jobId)}/contest/mark-winner`,
+            {
+                agent_token: token,
+                submission_id: params.submissionId,
+                ...(params.rankPosition !== undefined ? { rank_position: params.rankPosition } : {}),
+            },
+            undefined,
+            this.agentHeaders(token)
+        );
+    }
+
+    getCreatorJobDetail(jobId: string, agentToken?: string) {
+        const token = this.resolveAgentToken(agentToken);
+        const auth = this.mergeAuth(token, {});
+        return this.get(`/jobs/${encodeURIComponent(jobId)}/detail`, auth.params, auth.headers);
+    }
+
+    listJobParticipants(jobId: string, agentToken?: string) {
+        const token = this.resolveAgentToken(agentToken);
+        const auth = this.mergeAuth(token, {});
+        return this.get(`/jobs/${encodeURIComponent(jobId)}/users`, auth.params, auth.headers);
+    }
+
+    listJobPayments(jobId: string, agentToken?: string) {
+        const token = this.resolveAgentToken(agentToken);
+        const auth = this.mergeAuth(token, {});
+        return this.get(`/jobs/${encodeURIComponent(jobId)}/payments`, auth.params, auth.headers);
+    }
+
+    // ── Work + Money (x402 fund helpers) ────────────────────────────────────
+
+    /** Fund a marketplace order (402 → sign → retry). */
+    fundAgentOrder(orderId: number, opts: { settlementId?: number; agentToken?: string } = {}) {
+        const body: Record<string, unknown> = {};
+        if (opts.settlementId !== undefined) body.settlement_id = opts.settlementId;
+        return this.x402Post(`/agents/orders/${orderId}/fund`, body, opts.agentToken);
+    }
+
+    /**
+     * Create a marketplace order then fund it (402 → sign → settle).
+     * Same single flow as MCP `earnfi_hire_agent` / `earnfi_order_create`.
+     * On 402, response JSON includes `order_id` so you can retry `fundAgentOrder` without recreating.
+     */
+    async createAndFundOrder(
+        serviceId: number,
+        opts: {
+            input?: Record<string, unknown>;
+            settlementId?: number;
+            agentToken?: string;
+        } = {}
+    ): Promise<X402Response> {
+        if (opts.agentToken) this.agentToken = opts.agentToken;
+        const createRes = await this.agents.createOrder(serviceId, opts.input ?? {});
+        if (createRes.status < 200 || createRes.status >= 300) {
+            return createRes;
+        }
+
+        const created =
+            createRes.json && typeof createRes.json === 'object' && !Array.isArray(createRes.json)
+                ? (createRes.json as Record<string, unknown>)
+                : {};
+        const orderObj =
+            created.order && typeof created.order === 'object' && !Array.isArray(created.order)
+                ? (created.order as Record<string, unknown>)
+                : null;
+        const rawId = created.order_id ?? orderObj?.order_id ?? orderObj?.id;
+        const orderId = typeof rawId === 'number' ? rawId : Number(rawId);
+        if (!Number.isFinite(orderId) || orderId <= 0) {
+            return createRes;
+        }
+
+        const fundRes = await this.fundAgentOrder(orderId, {
+            settlementId: opts.settlementId,
+            agentToken: opts.agentToken,
+        });
+        const fundJson =
+            fundRes.json && typeof fundRes.json === 'object' && !Array.isArray(fundRes.json)
+                ? { ...(fundRes.json as Record<string, unknown>) }
+                : {};
+
+        return {
+            ...fundRes,
+            json: {
+                ...fundJson,
+                order_id: orderId,
+                public_slug: created.public_slug ?? fundJson.public_slug,
+                created_order: created,
+            },
+        };
+    }
+
+    /** Alias for {@link createAndFundOrder} — matches MCP `earnfi_hire_agent`. */
+    hireAndFund(
+        serviceId: number,
+        opts: {
+            input?: Record<string, unknown>;
+            settlementId?: number;
+            agentToken?: string;
+        } = {}
+    ) {
+        return this.createAndFundOrder(serviceId, opts);
+    }
+
+    /** Fund an agent escrow deal (402 → sign → retry). */
+    fundAgentDeal(dealId: number, opts: { settlementId?: number; agentToken?: string } = {}) {
+        const body: Record<string, unknown> = {};
+        if (opts.settlementId !== undefined) body.settlement_id = opts.settlementId;
+        return this.x402Post(`/agents/deals/${dealId}/fund`, body, opts.agentToken);
+    }
+}
+
+/** @deprecated Use {@link EarnFiAgentClient} */
+export { EarnFiAgentClient as EarnFiHttpClient };
+
+export type EarnFiHttpClientConfig = AgentClientOptions;
+export type EarnFiWalletLike = WalletLike;
+
+export type { JobCreatedResponse, RegisterSuccessResponse };
+export type {
+    HumanActionCreateInput,
+    HumanActionCreateResponse,
+    HumanActionResult,
+    HumanActionType,
+};

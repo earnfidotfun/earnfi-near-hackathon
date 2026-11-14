@@ -1,0 +1,28 @@
+{
+  "name": "@earnfi/mcp-server",
+  "version": "2.1.0",
+  "private": false,
+  "type": "module",
+  "description": "EarnFi MCP (Streamable HTTP): multichain x402 (Solana, Base, NEAR), OKX USDT0, Human Actions, marketplace, escrow, jobs, receipts, Equity Guard.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "node ./node_modules/typescript/lib/tsc.js -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "express": "^5.0.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

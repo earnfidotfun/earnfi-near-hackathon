@@ -1,0 +1,76 @@
+{
+  "name": "@earn-fi/agent-client",
+  "version": "2.8.0",
+  "description": "EarnFi Agent API SDK & CLI: production multichain x402 on ai-agent/v1 (Solana, Base, NEAR), Human Actions, jobs, marketplace, escrow, receipts, MCP-friendly flows.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "earnfi-agent": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build && npm test",
+    "test:smoke": "npm run build && node scripts/smoke-live.mjs",
+    "test:published": "node scripts/smoke-published.mjs"
+  },
+  "keywords": [
+    "earnfi",
+    "x402",
+    "agent",
+    "solana",
+    "base",
+    "near",
+    "usdc",
+    "human-actions",
+    "agent-marketplace",
+    "work-and-money",
+    "escrow",
+    "human-in-the-loop",
+    "capabilities"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/earnfidotfun/agent-client#readme",
+  "bugs": {
+    "url": "https://github.com/earnfidotfun/agent-client/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/earnfidotfun/agent-client.git"
+  },
+  "earnfiSkillVersion": "2.1.0",
+  "earnfiOpenApiVersion": "2.1.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.7"
+  },
+  "dependencies": {
+    "@fastnear/wallet": "^2.5.0",
+    "@fastnear/x402": "^2.5.0",
+    "@solana/spl-token": "^0.4.13",
+    "@solana/web3.js": "^1.98.4",
+    "@x402/core": "~2.18.0",
+    "@x402/evm": "~2.18.0",
+    "bs58": "^6.0.0",
+    "tweetnacl": "^1.0.3",
+    "viem": "^2.57.16"
+  }
+}
